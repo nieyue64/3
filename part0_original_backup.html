@@ -4978,174 +4978,29 @@ window.TU = window.TU || {};
     return c(tag, err);
   }
 
-  /** Severity levels for error classification */
-  const SEVERITY = { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', FATAL: 'fatal' };
-
-  /**
-   * Classify error severity based on tag and error type.
-   * Fatal: IDB write, save corruption, worker hang
-   * High: render pipeline, game init
-   * Medium: audio, UI
-   * Low: cosmetic, optional features
-   */
-  function classifyError(tag, error) {
-    const t = (tag || '').toLowerCase();
-    if (t.includes('idb') || t.includes('save') || t.includes('storage') || t.includes('quota')) return SEVERITY.FATAL;
-    if (t.includes('worker') && (t.includes('hang') || t.includes('timeout'))) return SEVERITY.FATAL;
-    if (t.includes('render') || t.includes('init') || t.includes('postfx')) return SEVERITY.HIGH;
-    if (t.includes('audio') || t.includes('ui') || t.includes('input')) return SEVERITY.MEDIUM;
-    if (error && error.name === 'QuotaExceededError') return SEVERITY.FATAL;
-    return SEVERITY.LOW;
-  }
-
   function run(tag, fn, opts) {
     try {
       return fn();
     } catch (e) {
       const o = opts || {};
       const level = o.level || "error";
-      const severity = o.severity || classifyError(tag, e);
-      const entry = { tag: tag || "unknown", error: e, at: Date.now(), severity: severity };
+      const entry = { tag: tag || "unknown", error: e, at: Date.now() };
       errors.push(entry);
       errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
-      // Always log to console -- never swallow silently
       try {
-        log(level, '[TU.Safe] ' + tag, e);
-      } catch (logErr) {
-        console.error('[TU.Safe] logging failed for:', tag, e, logErr);
-      }
-      // Surface fatal/high errors to user via toast
-      if (severity === SEVERITY.FATAL || severity === SEVERITY.HIGH) {
-        toast(o.toastMessage || ('\u26a0\ufe0f Error in ' + (tag || 'unknown')), o.toastMs || 3000, o.toastKey || tag, o.cooldownMs || 5000);
-      } else if (o.toastMessage) {
-        toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
-      }
-      // Emit error event for monitoring
-      try {
-        if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-          window.GameEvents.emit('error:caught', { tag, error: e, severity, at: Date.now() });
-        }
-      } catch (_) { /* prevent infinite recursion */ }
+        log(level, tag, e);
+      } catch(e){console.warn('[Catch]',e);}
+      if (o.toastMessage) toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
       if (o.rethrow) throw e;
       return o.fallback;
     }
   }
-
-  /**
-   * Async-safe version of run() for Promise-based operations.
-   * Catches both sync throws and async rejections.
-   * @param {string} tag - Error context tag
-   * @param {Function} asyncFn - Async function to execute
-   * @param {Object} [opts] - Options (same as run, plus onError callback)
-   * @returns {Promise<*>} Result or fallback
-   */
-  async function runAsync(tag, asyncFn, opts) {
-    try {
-      return await asyncFn();
-    } catch (e) {
-      const o = opts || {};
-      const level = o.level || "error";
-      const severity = o.severity || classifyError(tag, e);
-      const entry = { tag: tag || "unknown", error: e, at: Date.now(), severity: severity, async: true };
-      errors.push(entry);
-      errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
-      try {
-        log(level, '[TU.Safe.async] ' + tag, e);
-      } catch (logErr) {
-        console.error('[TU.Safe.async] logging failed for:', tag, e, logErr);
-      }
-      if (severity === SEVERITY.FATAL || severity === SEVERITY.HIGH) {
-        toast(o.toastMessage || ('\u26a0\ufe0f Async error in ' + (tag || 'unknown')), o.toastMs || 3000, o.toastKey || tag, o.cooldownMs || 5000);
-      } else if (o.toastMessage) {
-        toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
-      }
-      try {
-        if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-          window.GameEvents.emit('error:caught', { tag, error: e, severity, at: Date.now(), async: true });
-        }
-      } catch (_) { /* prevent infinite recursion */ }
-      if (typeof o.onError === 'function') {
-        try { o.onError(e, tag, severity); } catch (_) {}
-      }
-      if (o.rethrow) throw e;
-      return o.fallback;
-    }
-  }
-
-  /**
-   * GlobalErrorBoundary: monitors critical subsystems for silent failures
-   * - Worker message timeout detection
-   * - IDB write failure tracking
-   * - Audio context state monitoring
-   */
-  const GlobalErrorBoundary = {
-    _workerTimeouts: new Map(),
-    _idbFailures: 0,
-    _maxIdbFailures: 5,
-
-    /** Track a pending worker message; fires callback if no response within timeoutMs */
-    trackWorkerMessage(id, timeoutMs, onTimeout) {
-      const timer = setTimeout(() => {
-        GlobalErrorBoundary._workerTimeouts.delete(id);
-        const msg = 'Worker message ' + id + ' timed out after ' + timeoutMs + 'ms';
-        console.error('[GlobalErrorBoundary]', msg);
-        errors.push({ tag: 'worker:timeout', error: new Error(msg), at: Date.now(), severity: SEVERITY.FATAL });
-        toast('\u26a0\ufe0f Worker hung: ' + id, 3000, 'worker-timeout-' + id, 10000);
-        if (typeof onTimeout === 'function') onTimeout(id);
-      }, timeoutMs || 30000);
-      GlobalErrorBoundary._workerTimeouts.set(id, timer);
-    },
-
-    /** Clear a tracked worker message (response received) */
-    clearWorkerMessage(id) {
-      const timer = GlobalErrorBoundary._workerTimeouts.get(id);
-      if (timer) { clearTimeout(timer); GlobalErrorBoundary._workerTimeouts.delete(id); }
-    },
-
-    /** Record an IDB write failure; triggers degraded mode after threshold */
-    recordIdbFailure(error) {
-      GlobalErrorBoundary._idbFailures++;
-      console.error('[GlobalErrorBoundary] IDB write failure #' + GlobalErrorBoundary._idbFailures, error);
-      if (GlobalErrorBoundary._idbFailures >= GlobalErrorBoundary._maxIdbFailures) {
-        toast('\u26a0\ufe0f IndexedDB repeatedly failing - saves may be lost!', 5000, 'idb-critical', 30000);
-        try {
-          if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-            window.GameEvents.emit('storage:critical', { failures: GlobalErrorBoundary._idbFailures });
-          }
-        } catch (_) {}
-      }
-    },
-
-    /** Check audio context health */
-    checkAudioHealth(audioCtx) {
-      if (!audioCtx) return;
-      if (audioCtx.state === 'closed') {
-        console.warn('[GlobalErrorBoundary] AudioContext is closed unexpectedly');
-        toast('\u26a0\ufe0f Audio context closed', 2000, 'audio-closed', 15000);
-      }
-    },
-
-    /** Get error summary for diagnostics */
-    getSummary() {
-      const byTag = {};
-      const bySeverity = { low: 0, medium: 0, high: 0, fatal: 0 };
-      for (const e of errors) {
-        byTag[e.tag] = (byTag[e.tag] || 0) + 1;
-        if (e.severity) bySeverity[e.severity] = (bySeverity[e.severity] || 0) + 1;
-      }
-      return { total: errors.length, byTag, bySeverity, idbFailures: GlobalErrorBoundary._idbFailures, pendingWorkers: GlobalErrorBoundary._workerTimeouts.size };
-    }
-  };
 
   TU.Safe = {
     run,
-    runAsync,
     toast,
     shouldFire,
-    errors,
-    SEVERITY,
-    classifyError,
-    GlobalErrorBoundary
+    errors
   };
 })();
 document.getElementById('error-toggle')?.addEventListener('click', function() {
@@ -5272,31 +5127,18 @@ window.AppServices = new class ServiceLocator {
         try {
           return localStorage.getItem(k);
         } catch (e) {
-          console.warn('[Storage.get] failed for key:', k, e);
           return null;
         }
       },
       set: (k, v) => {
         try {
           localStorage.setItem(k, v);
-        } catch (e) {
-          console.error('[Storage.set] failed for key:', k, e);
-          if (e && e.name === 'QuotaExceededError') {
-            try {
-              if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-                window.GameEvents.emit('storage:quotaExceeded', { key: k, error: e });
-                window.GameEvents.emit('ui:toast', '\u26a0\ufe0f Storage quota exceeded! Save data may be lost.', 4000);
-              }
-            } catch (_) {}
-          }
-        }
+        } catch(e){console.warn('[Catch]',e);}
       },
       remove: k => {
         try {
           window.localStorage.removeItem(k);
-        } catch (e) {
-          console.warn('[Storage.remove] failed for key:', k, e);
-        }
+        } catch(e){console.warn('[Catch]',e);}
       }
     });
     this.register("session", {
@@ -5556,321 +5398,53 @@ window.Events = {
   once: function(event, cb, opts) { return window.GameEvents.once(event, cb, opts); }
 };
 
-// --- [Phase 3] Block Registry with Palette Mapping ---
-// Prevents ID drift when patch load order changes.
-// All dynamic block IDs should be allocated through BlockRegistry.allocate().
-// Save data includes a palette mapping header for safe deserialization.
-window.TU.BlockRegistry = {
-  _nameToId: new Map(),    // 'pump_in' -> 206
-  _idToName: new Map(),    // 206 -> 'pump_in'
-  _nextDynamic: 200,       // Dynamic IDs start at 200 (below this = core blocks)
-  _frozen: false,          // Once frozen (after init), no new allocations
-
-  /**
-   * Allocate a deterministic ID for a named block type.
-   * If the name already has an ID, returns the existing one.
-   * @param {string} name - Unique block name (e.g., 'WIRE_OFF', 'PUMP_IN')
-   * @param {number} [preferredId] - Preferred ID (used if available)
-   * @returns {number} The allocated block ID
-   */
-  allocate(name, preferredId) {
-    if (this._nameToId.has(name)) return this._nameToId.get(name);
-    
-    let id;
-    if (typeof preferredId === 'number' && preferredId >= 0 && !this._idToName.has(preferredId)) {
-      id = preferredId;
-    } else {
-      // Find next available ID
-      const BD = window.BLOCK_DATA || {};
-      const used = new Set(this._idToName.keys());
-      if (window.BLOCK && typeof window.BLOCK === 'object') {
-        for (const k in window.BLOCK) used.add(0 | window.BLOCK[k]);
-      }
-      for (let probe = this._nextDynamic; probe < 255; probe++) {
-        if (!BD[probe] && !used.has(probe)) { id = probe; break; }
-      }
-      if (id === undefined) {
-        console.error('[BlockRegistry] No free IDs available for:', name);
-        return -1;
-      }
-    }
-    
-    this._nameToId.set(name, id);
-    this._idToName.set(id, name);
-    if (id >= this._nextDynamic) this._nextDynamic = id + 1;
-    return id;
-  },
-
-  /**
-   * Get the palette mapping for serialization into save headers.
-   * @returns {Object} Map of name -> id for all registered blocks
-   */
-  getPalette() {
-    const palette = {};
-    for (const [name, id] of this._nameToId) palette[name] = id;
-    return palette;
-  },
-
-  /**
-   * Apply a palette mapping from a save header.
-   * Remaps block IDs in the world data if they differ from current allocation.
-   * @param {Object} savedPalette - The palette from the save header
-   * @returns {Map|null} Remap table (oldId -> newId) or null if no remapping needed
-   */
-  applyPalette(savedPalette) {
-    if (!savedPalette || typeof savedPalette !== 'object') return null;
-    const remap = new Map();
-    let needsRemap = false;
-    
-    for (const name in savedPalette) {
-      const savedId = 0 | savedPalette[name];
-      const currentId = this._nameToId.get(name);
-      if (currentId !== undefined && currentId !== savedId) {
-        remap.set(savedId, currentId);
-        needsRemap = true;
-      }
-    }
-    
-    return needsRemap ? remap : null;
-  },
-
-  /**
-   * Get name for an ID (for debugging/logging).
-   * @param {number} id
-   * @returns {string|undefined}
-   */
-  getName(id) {
-    return this._idToName.get(id);
-  },
-
-  /**
-   * Freeze the registry (prevent further allocations after game init).
-   */
-  freeze() {
-    this._frozen = true;
-    console.log('[BlockRegistry] Frozen with', this._nameToId.size, 'entries:', this.getPalette());
-  }
-};
-
-// --- [Phase 3] StorageAdapter with explicit degradation ---
-// Wraps localStorage + IndexedDB with proper error reporting and degradation flow.
-window.TU.StorageAdapter = {
-  _mode: 'full',  // 'full' | 'idb-only' | 'ls-only' | 'degraded'
-  _lsAvailable: true,
-  _idbAvailable: true,
-
-  /**
-   * Detect storage capabilities.
-   */
-  async detect() {
-    // Test localStorage
-    try {
-      const testKey = '__tu_storage_test__';
-      localStorage.setItem(testKey, '1');
-      localStorage.removeItem(testKey);
-      this._lsAvailable = true;
-    } catch (e) {
-      this._lsAvailable = false;
-      console.warn('[StorageAdapter] localStorage unavailable:', e.message);
-    }
-    
-    // Test IndexedDB
-    try {
-      const idb = window.TU_IndexedDBStorage || window.AppServices.get('indexedDBStorage');
-      if (idb && typeof idb.init === 'function') {
-        await idb.init();
-        this._idbAvailable = true;
-      } else {
-        this._idbAvailable = false;
-      }
-    } catch (e) {
-      this._idbAvailable = false;
-      console.warn('[StorageAdapter] IndexedDB unavailable:', e.message);
-    }
-
-    // Determine mode
-    if (this._lsAvailable && this._idbAvailable) {
-      this._mode = 'full';
-    } else if (this._idbAvailable) {
-      this._mode = 'idb-only';
-    } else if (this._lsAvailable) {
-      this._mode = 'ls-only';
-    } else {
-      this._mode = 'degraded';
-      console.error('[StorageAdapter] No persistent storage available!');
-      try {
-        window.GameEvents && window.GameEvents.emit('ui:toast', '\u26a0\ufe0f No storage available - progress cannot be saved!', 5000);
-      } catch (_) {}
-    }
-    
-    console.log('[StorageAdapter] Mode:', this._mode, 'LS:', this._lsAvailable, 'IDB:', this._idbAvailable);
-    return this._mode;
-  },
-
-  /**
-   * Get current storage mode.
-   */
-  getMode() { return this._mode; },
-
-  /**
-   * Write data with automatic degradation.
-   * @param {string} key
-   * @param {*} value - Will be JSON.stringified for localStorage
-   * @param {Object} [opts] - { preferIDB: boolean }
-   * @returns {Promise<{ok: boolean, lsOk: boolean, idbOk: boolean, error?: Error}>}
-   */
-  async write(key, value, opts) {
-    const o = opts || {};
-    let lsOk = false, idbOk = false, lastError = null;
-
-    // Try localStorage first (unless preferIDB)
-    if (this._lsAvailable && !o.preferIDB) {
-      try {
-        const serialized = typeof value === 'string' ? value : JSON.stringify(value);
-        localStorage.setItem(key, serialized);
-        lsOk = true;
-      } catch (e) {
-        lastError = e;
-        if (e.name === 'QuotaExceededError') {
-          console.error('[StorageAdapter] LS quota exceeded for key:', key);
-          this._lsAvailable = false;
-          this._mode = this._idbAvailable ? 'idb-only' : 'degraded';
-          try {
-            window.GameEvents && window.GameEvents.emit('storage:quotaExceeded', { key, storage: 'localStorage', error: e });
-          } catch (_) {}
+// --- TU Canvas State Optimizer Injected ---
+!function () {
+  const originalGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, options) {
+    const ctx = originalGetContext.call(this, type, options);
+    if ("2d" === type && ctx && !ctx.__tu_optimized) {
+      ctx.__tu_optimized = !0;
+      let currentAlpha = 1,
+        currentFill = "#000000";
+      // Override setters to prevent redundant calls to C++ bindings
+      Object.defineProperty(ctx, "globalAlpha", {
+        get: function () {
+          return currentAlpha;
+        },
+        set: function (val) {
+          currentAlpha !== val && (currentAlpha = val,
+          // Use internal setter
+          Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "globalAlpha").set.call(this, val));
         }
-      }
-    }
-
-    // Try IndexedDB
-    if (this._idbAvailable) {
-      try {
-        const idb = window.TU_IndexedDBStorage || window.AppServices.get('indexedDBStorage');
-        if (idb) {
-          idbOk = await idb.set(key, value);
+      });
+      Object.defineProperty(ctx, "fillStyle", {
+        get: function () {
+          return currentFill;
+        },
+        set: function (val) {
+          currentFill !== val && (currentFill = val, Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "fillStyle").set.call(this, val));
         }
-      } catch (e) {
-        lastError = e;
-        console.error('[StorageAdapter] IDB write failed for key:', key, e);
-        try {
-          const boundary = window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-          if (boundary) boundary.recordIdbFailure(e);
-        } catch (_) {}
-      }
+      }); // Intercept save/restore to track state (optional, but complex, leaving alpha/fill is 80% of the gain)
+      const origSave = ctx.save,
+        origRestore = ctx.restore,
+        stateStack = [];
+      ctx.save = function () {
+        stateStack.push({
+          alpha: currentAlpha,
+          fill: currentFill
+        });
+        origSave.call(this);
+      };
+      ctx.restore = function () {
+        const state = stateStack.pop();
+        if (state) { currentAlpha = state.alpha; currentFill = state.fill; }
+        origRestore.call(this);
+      };
     }
-
-    return { ok: lsOk || idbOk, lsOk, idbOk, error: (!lsOk && !idbOk) ? lastError : undefined };
-  },
-
-  /**
-   * Read data with automatic degradation.
-   * @param {string} key
-   * @param {Object} [opts] - { preferIDB: boolean, parse: boolean }
-   * @returns {Promise<*>} The stored value or null
-   */
-  async read(key, opts) {
-    const o = opts || {};
-    
-    // Try IDB first if preferred
-    if (this._idbAvailable && o.preferIDB) {
-      try {
-        const idb = window.TU_IndexedDBStorage || window.AppServices.get('indexedDBStorage');
-        if (idb) {
-          const val = await idb.get(key);
-          if (val !== null && val !== undefined) return val;
-        }
-      } catch (e) {
-        console.warn('[StorageAdapter] IDB read failed for key:', key, e);
-      }
-    }
-
-    // Try localStorage
-    if (this._lsAvailable) {
-      try {
-        const raw = localStorage.getItem(key);
-        if (raw !== null) {
-          return o.parse ? JSON.parse(raw) : raw;
-        }
-      } catch (e) {
-        console.warn('[StorageAdapter] LS read failed for key:', key, e);
-      }
-    }
-
-    // Try IDB as fallback
-    if (this._idbAvailable && !o.preferIDB) {
-      try {
-        const idb = window.TU_IndexedDBStorage || window.AppServices.get('indexedDBStorage');
-        if (idb) return await idb.get(key);
-      } catch (e) {
-        console.warn('[StorageAdapter] IDB fallback read failed for key:', key, e);
-      }
-    }
-
-    return null;
-  }
-};
-
-// Auto-detect storage on load
-try {
-  window.TU.StorageAdapter.detect();
-} catch (_) {}
-
-// --- [Phase 2] Scoped Canvas State Optimizer ---
-// BEFORE: Hijacked HTMLCanvasElement.prototype.getContext globally, affecting ALL canvases
-// (weather overlays, offscreen buffers, minimap, etc.) and breaking V8 prototype chain optimization.
-// AFTER: CanvasOptimizer.optimize(ctx) is called ONLY on the game's main canvas context.
-// This preserves native performance for all other canvases while optimizing the hot path.
-window.TU.CanvasOptimizer = {
-  /**
-   * Apply state-change deduplication to a specific 2D context.
-   * Only call this on the main game canvas context.
-   * @param {CanvasRenderingContext2D} ctx - The context to optimize
-   * @returns {CanvasRenderingContext2D} The same context, now optimized
-   */
-  optimize(ctx) {
-    if (!ctx || ctx.__tu_optimized) return ctx;
-    ctx.__tu_optimized = !0;
-    let currentAlpha = 1,
-      currentFill = "#000000";
-    const alphaDesc = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "globalAlpha");
-    const fillDesc = Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "fillStyle");
-    Object.defineProperty(ctx, "globalAlpha", {
-      get: function () { return currentAlpha; },
-      set: function (val) {
-        currentAlpha !== val && (currentAlpha = val, alphaDesc.set.call(this, val));
-      }
-    });
-    Object.defineProperty(ctx, "fillStyle", {
-      get: function () { return currentFill; },
-      set: function (val) {
-        currentFill !== val && (currentFill = val, fillDesc.set.call(this, val));
-      }
-    });
-    const origSave = ctx.save, origRestore = ctx.restore, stateStack = [];
-    ctx.save = function () {
-      stateStack.push({ alpha: currentAlpha, fill: currentFill });
-      origSave.call(this);
-    };
-    ctx.restore = function () {
-      const state = stateStack.pop();
-      if (state) { currentAlpha = state.alpha; currentFill = state.fill; }
-      origRestore.call(this);
-    };
     return ctx;
-  }
-};
-// Apply optimizer to game canvas on init (deferred until canvas exists)
-window.GameEvents && window.GameEvents.on('game:init:post', function _applyCanvasOpt(game) {
-  try {
-    const renderer = game && game.renderer;
-    if (renderer && renderer.ctx) {
-      window.TU.CanvasOptimizer.optimize(renderer.ctx);
-      console.log('[CanvasOptimizer] Applied to game canvas only');
-    }
-  } catch (e) {
-    console.warn('[CanvasOptimizer] Failed to apply:', e);
-  }
-});
+  };
+}();
 // ------------------------------------------
 let __tu_rand_idx = 0;
 const __TU_RAND_LUT = new Float32Array(16384);
@@ -8937,9 +8511,6 @@ class AudioManager {
     this.ctx = null;
     this._noiseBuf = null;
     this._armed = false;
-    // [Phase 1] Merged from tu_experience_optimizations_v3 patch:
-    // enabled flag used by updateWeatherAmbience (was causing undefined reference)
-    this.enabled = true;
     if (window.GameEvents && window.GameEvents.on) {
       window.GameEvents.on("audio:play", clip => this.play(clip));
       window.GameEvents.on("audio:setVolume", v => this.setVolume(v));
@@ -8947,25 +8518,6 @@ class AudioManager {
     if (window.AppServices && window.AppServices.register) {
       window.AppServices.register("audio", this);
     }
-    // [Phase 1] Battery saver: suspend/resume AudioContext on tab visibility
-    // Merged from tu_experience_optimizations_v3 patch to avoid prototype override
-    const self = this;
-    const suspendAudio = () => {
-      if (self.ctx && self.ctx.state === 'running') {
-        self.ctx.suspend().catch(() => {});
-      }
-    };
-    const resumeAudio = () => {
-      if (self.ctx && self.ctx.state === 'suspended') {
-        self.ctx.resume().catch(() => {});
-      }
-    };
-    document.addEventListener("visibilitychange", () => {
-      document.hidden ? suspendAudio() : resumeAudio();
-    }, { passive: !0 });
-    window.addEventListener("pageshow", resumeAudio, { passive: !0 });
-    window.addEventListener("focus", resumeAudio, { passive: !0 });
-    window.addEventListener("pagehide", suspendAudio, { passive: !0 });
   }
   arm() {
     if (this._armed) return;
@@ -9115,8 +8667,6 @@ class AudioManager {
 Object.assign(window.TU, {
   AudioManager: AudioManager
 });
-// [Phase 1] Mark prototype so audio vis patch in tu_experience_optimizations_v3 skips
-AudioManager.prototype.__tuAudioVisPatch = !0;
 
 // === IndexedDB Storage Manager (OPT) ===
 (function() {
@@ -9189,12 +8739,7 @@ AudioManager.prototype.__tuAudioVisPatch = !0;
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        console.error('[IndexedDBStorage] set failed:', key, e);
-        // Report to GlobalErrorBoundary for IDB failure tracking
-        try {
-          const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-          if (boundary) boundary.recordIdbFailure(e);
-        } catch (_) {}
+        console.warn('[IndexedDBStorage] set failed:', e);
         return false;
       }
     }
@@ -9211,11 +8756,7 @@ AudioManager.prototype.__tuAudioVisPatch = !0;
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        console.error('[IndexedDBStorage] remove failed:', key, e);
-        try {
-          const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-          if (boundary) boundary.recordIdbFailure(e);
-        } catch (_) {}
+        console.warn('[IndexedDBStorage] remove failed:', e);
         return false;
       }
     }
@@ -9232,11 +8773,7 @@ AudioManager.prototype.__tuAudioVisPatch = !0;
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        console.error('[IndexedDBStorage] clear failed:', e);
-        try {
-          const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-          if (boundary) boundary.recordIdbFailure(e);
-        } catch (_) {}
+        console.warn('[IndexedDBStorage] clear failed:', e);
         return false;
       }
     }
@@ -18925,13 +18462,6 @@ class Renderer {
         alpha: !1
       }));
       this.ctx.imageSmoothingEnabled = !1;
-      // [Phase 2 fix] Apply CanvasOptimizer immediately to game canvas context
-      // This ensures optimization is active from the very first frame (texture warmup etc.)
-      try {
-        if (window.TU && window.TU.CanvasOptimizer && typeof window.TU.CanvasOptimizer.optimize === 'function') {
-          window.TU.CanvasOptimizer.optimize(this.ctx);
-        }
-      } catch (_) {}
     }
     window.GameEvents.on('block:written', e => this.invalidateTile(e.x, e.y));
     if (!this.ctx) throw Error("Canvas 2D context initialization failed");
@@ -18963,11 +18493,6 @@ class Renderer {
     this._speedBlurAmt = 0;
     this._speedBlurDirX = 1;
     this._speedBlurBuf = null;
-    // [Phase 2] PostFX Pipeline: ordered stages replace nested wrapping
-    // Each stage: { name: string, order: number, fn: (ctx, time, depth01, reducedMotion, renderer) => void }
-    // Stages are executed in order. New stages can be registered via registerPostFxStage().
-    this.postFxPipeline = [];
-    this._postFxPipelineSorted = false;
     // Unified chunk management system
     this._chunkManager = new ChunkManager();
     this._chunkSize = 16;
@@ -21410,51 +20935,6 @@ class Renderer {
   postProcess(time = .5) {
     this.applyPostFX(time, 0, !1);
   }
-  /**
-   * [Phase 2] Register a named PostFX pipeline stage.
-   * Stages are executed in ascending order. Same-name stages are replaced.
-   * @param {string} name - Unique stage name (e.g., 'weather-tint', 'underwater-fog')
-   * @param {number} order - Execution order (lower = earlier). Base=10, Weather=20, Underwater=30
-   * @param {Function} fn - Stage function: (ctx, time, depth01, reducedMotion, renderer) => void
-   */
-  registerPostFxStage(name, order, fn) {
-    // Remove existing stage with same name
-    this.postFxPipeline = this.postFxPipeline.filter(s => s.name !== name);
-    this.postFxPipeline.push({ name, order, fn });
-    this._postFxPipelineSorted = false;
-    console.log('[Renderer] PostFX stage registered:', name, 'order:', order);
-  }
-  /**
-   * [Phase 2] Remove a named PostFX pipeline stage.
-   * @param {string} name - Stage name to remove
-   */
-  removePostFxStage(name) {
-    this.postFxPipeline = this.postFxPipeline.filter(s => s.name !== name);
-  }
-  /**
-   * [Phase 2] Execute all registered PostFX pipeline stages in order.
-   * Called by patches that want to use the pipeline instead of wrapping.
-   * @param {number} time - Time of day (0-1)
-   * @param {number} depth01 - Player depth (0=surface, 1=bottom)
-   * @param {boolean} reducedMotion - Whether reduced motion is enabled
-   */
-  runPostFxPipeline(time, depth01, reducedMotion) {
-    if (!this.postFxPipeline.length) return;
-    if (!this._postFxPipelineSorted) {
-      this.postFxPipeline.sort((a, b) => a.order - b.order);
-      this._postFxPipelineSorted = true;
-    }
-    const ctx = this.ctx;
-    if (!ctx) return;
-    for (let i = 0, len = this.postFxPipeline.length; i < len; i++) {
-      const stage = this.postFxPipeline[i];
-      try {
-        stage.fn(ctx, time, depth01, reducedMotion, this);
-      } catch (e) {
-        console.error('[Renderer.postFxPipeline] Stage "' + stage.name + '" failed:', e);
-      }
-    }
-  }
   // Utility methods: merged from multiple patch versions for backward compatibility
   /**
    * @method renderBackgroundCached
@@ -23553,37 +23033,6 @@ class InputManager {
       const fm = window.TU && window.TU.FullscreenManager;
       fm && "function" == typeof fm.toggle ? fm.toggle() : document.fullscreenElement ? document.exitFullscreen() : (document.documentElement).requestFullscreen();
     });
-    // [Phase 1] Anti-stuck-key safety (merged from tu_experience_optimizations_v3 patch)
-    // Prevents keys/mouse buttons from getting stuck when window loses focus
-    const resetMouseButtons = () => {
-      game && game.input && (window.GameEvents.emit('input:set', 'mouseLeft', false), window.GameEvents.emit('input:set', 'mouseRight', false));
-    };
-    const resetAll = () => {
-      game && game.input && (window.GameEvents.emit('input:set', 'left', false), window.GameEvents.emit('input:set', 'right', false), window.GameEvents.emit('input:set', 'jump', false), window.GameEvents.emit('input:set', 'sprint', false));
-      resetMouseButtons();
-    };
-    window.addEventListener("blur", resetAll, { passive: !0 });
-    document.addEventListener("visibilitychange", () => { document.hidden && resetAll(); }, { passive: !0 });
-    canvas && canvas.addEventListener("mouseleave", resetMouseButtons, { passive: !0 });
-    window.addEventListener("mouseup", resetMouseButtons, { passive: !0 });
-    // Mouse wheel hotbar scrolling (merged from patch)
-    canvas && !canvas.__tuWheelBound && (canvas.__tuWheelBound = !0, canvas.addEventListener("wheel", e => {
-      if (e.ctrlKey) return;
-      const g = window.AppServices.get("game");
-      const ui = window.AppServices.get("ui");
-      if (!g || !ui || !g.player) return;
-      if (window.AppServices.get("uiState") && window.AppServices.get("uiState").isAnyOpen() || g._inputBlocked) return;
-      const dx = +e.deltaX || 0, dy = +e.deltaY || 0;
-      const delta = (0 > dx ? -dx : dx) > (0 > dy ? -dy : dy) ? dx : dy;
-      if (!delta || 1 > (0 > delta ? -delta : delta)) return;
-      e.preventDefault();
-      const dir = delta > 0 ? 1 : -1;
-      const next = ((0 | (Number.isFinite(g.player.selectedSlot) ? g.player.selectedSlot : 0)) + dir + 9) % 9;
-      try { window.GameEvents && window.GameEvents.emit && window.GameEvents.emit("ui:selectSlot", next); } catch(e){console.warn('[InputManager.wheel]',e);}
-    }, { passive: !1 }));
-    // Mark as bound so patch doesn't re-install
-    this.__tuExtraBound = !0;
-    this.__tuInputSafety = !0;
   }
   /**
    * Fixed-step tick to compute "hold A/D to sprint" without being affected by key repeat.
@@ -23607,8 +23056,6 @@ class InputManager {
 Object.assign(window.TU, {
   InputManager: InputManager
 });
-// [Phase 1] Mark prototype so monkey patch in tu_experience_optimizations_v3 skips
-InputManager.prototype.__tuInputSafety = !0;
 class InventorySystem {
   /** @param {Game} game */
   constructor(game) {
@@ -27776,14 +27223,13 @@ window.TU;
     BC = void 0 !== BLOCK_COLOR ? BLOCK_COLOR : null,
     BCP = void 0 !== BLOCK_COLOR_PACKED ? BLOCK_COLOR_PACKED : null,
     SD = void 0 !== SUN_DECAY ? SUN_DECAY : null,
-    // [Phase 3] Use BlockRegistry for deterministic ID allocation
     IDS = {
-      WIRE_OFF: window.TU.BlockRegistry ? window.TU.BlockRegistry.allocate('WIRE_OFF', 200) : 200,
-      WIRE_ON: window.TU.BlockRegistry ? window.TU.BlockRegistry.allocate('WIRE_ON', 201) : 201,
-      SWITCH_OFF: window.TU.BlockRegistry ? window.TU.BlockRegistry.allocate('SWITCH_OFF', 202) : 202,
-      SWITCH_ON: window.TU.BlockRegistry ? window.TU.BlockRegistry.allocate('SWITCH_ON', 203) : 203,
-      LAMP_OFF: window.TU.BlockRegistry ? window.TU.BlockRegistry.allocate('LAMP_OFF', 204) : 204,
-      LAMP_ON: window.TU.BlockRegistry ? window.TU.BlockRegistry.allocate('LAMP_ON', 205) : 205
+      WIRE_OFF: 200,
+      WIRE_ON: 201,
+      SWITCH_OFF: 202,
+      SWITCH_ON: 203,
+      LAMP_OFF: 204,
+      LAMP_ON: 205
     };
   function addBlock(id, def) {
     if (BD[id] = def, SOLID[id] = def.solid ? 1 : 0, TRANSP[id] = def.transparent ? 1 : 0, LIQ[id] = def.liquid ? 1 : 0, BL && (BL[id] = def.light ? 0 | def.light : 0), BH && (BH[id] = def.hardness ? +def.hardness : 0), BC && (BC[id] = def.color), SD) {
@@ -29437,12 +28883,16 @@ window.TU;
           Game = TU.Game,
           InputManager = TU.InputManager,
           AudioManager = TU.AudioManager;
-        // [Phase 1 FIX] Removed duplicate game:init:post emission.
-        // The original Game.init() already emits 'game:init:post' at end of init().
-        // This wrapper was causing double-fire of the event, triggering all listeners twice.
-        // Flag preserved to prevent other patches from re-installing this wrapper.
-        if (Game && Game.prototype) {
+        if (Game && Game.prototype && !Game.prototype.__tuGameReadyEvent) {
           Game.prototype.__tuGameReadyEvent = !0;
+          const _init = Game.prototype.init;
+          "function" == typeof _init && (Game.prototype.init = async function (...args) {
+            const r = await _init.apply(this, args);
+            try {
+              window.GameEvents.emit("game:init:post", this);
+            } catch(e){console.warn('[Catch]',e);}
+            return r;
+          });
         }
         if (InputManager && InputManager.prototype && !InputManager.prototype.__tuInputSafety) {
           InputManager.prototype.__tuInputSafety = !0;
@@ -29590,11 +29040,7 @@ window.TU;
           return .34 > t ? "forest" : .68 > t ? "desert" : "snow";
         };
         const IDS = TU.LOGIC_BLOCKS || (TU.LOGIC_BLOCKS = {});
-        // [Phase 3] Use BlockRegistry for deterministic ID allocation
-        const _BR = TU.BlockRegistry || null;
-        function allocId(name, start) {
-          if (_BR && typeof name === 'string') return _BR.allocate(name, start);
-          // Legacy fallback
+        function allocId(start) {
           try {
             const used = new Set();
             if (BLOCK && "object" == typeof BLOCK) for (const k in BLOCK) used.add(0 | BLOCK[k]);
@@ -29605,27 +29051,41 @@ window.TU;
         function addBlock(id, def) {
           try {
             BD[id] = def;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             SOLID[id] = def.solid ? 1 : 0;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             TRANSP[id] = def.transparent ? 1 : 0;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             LIQ[id] = def.liquid ? 1 : 0;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             BL && (BL[id] = def.light ? 0 | def.light : 0);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             BH && (BH[id] = def.hardness ? +def.hardness : 0);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             BC && (BC[id] = def.color);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             WALK && (WALK[id] = def.solid ? 0 : 1);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             if (SD) {
               const AIR = BLOCK && void 0 !== BLOCK.AIR ? BLOCK.AIR : 0;
               let v = 0;
               def.solid && !def.transparent ? v = 3 : def.transparent && id !== AIR && (v = 1);
               SD[id] = v;
             }
-          } catch (e) {
-            console.error('[addBlock] Failed to register block id=' + id + ' name=' + (def && def.name), e);
-          }
+          } catch(e){console.warn('[Catch]',e);}
         }
-        IDS.PUMP_IN || (IDS.PUMP_IN = allocId('PUMP_IN', 206));
-        IDS.PUMP_OUT || (IDS.PUMP_OUT = allocId('PUMP_OUT', 1 + (0 | IDS.PUMP_IN)));
-        IDS.PLATE_OFF || (IDS.PLATE_OFF = allocId('PLATE_OFF', 1 + (0 | IDS.PUMP_OUT)));
-        IDS.PLATE_ON || (IDS.PLATE_ON = allocId('PLATE_ON', 1 + (0 | IDS.PLATE_OFF)));
+        IDS.PUMP_IN || (IDS.PUMP_IN = allocId(206));
+        IDS.PUMP_OUT || (IDS.PUMP_OUT = allocId(1 + (0 | IDS.PUMP_IN)));
+        IDS.PLATE_OFF || (IDS.PLATE_OFF = allocId(1 + (0 | IDS.PUMP_OUT)));
+        IDS.PLATE_ON || (IDS.PLATE_ON = allocId(1 + (0 | IDS.PLATE_OFF)));
         try {
           BD[IDS.PUMP_IN] || (addBlock(IDS.PUMP_IN, {
             name: "泵(入水口)",
@@ -31477,19 +30937,6 @@ window.TU;
                 progressCb: "function" == typeof progressCb ? progressCb : null,
                 t0: _safeNow()
               };
-              // [Phase 3] Track worker message with GlobalErrorBoundary for timeout detection
-              try {
-                const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-                if (boundary) {
-                  boundary.trackWorkerMessage('generate-' + id, 60000, () => {
-                    // Worker hung for 60s - reject the promise
-                    if (this._pendingGen && this._pendingGen.id === id) {
-                      this._pendingGen = null;
-                      reject(new Error('Worker generate timed out after 60s'));
-                    }
-                  });
-                }
-              } catch (_) {}
               this.worker.postMessage({
                 type: "generate",
                 id: id,
@@ -31513,11 +30960,6 @@ window.TU;
                 if ("progress" !== msg.type) {
                   if ("done" === msg.type) {
                     if (!this._pendingGen || msg.id !== this._pendingGen.id) return;
-                    // [Phase 3] Clear worker timeout tracking
-                    try {
-                      const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-                      if (boundary) boundary.clearWorkerMessage('generate-' + msg.id);
-                    } catch (_) {}
                     const {
                       resolve: resolve,
                       t0: t0
@@ -31972,90 +31414,6 @@ window.TU;
       P.enabled = "1" === window.AppServices.get("storage").get("tu_profiler_enabled");
       return P;
     }();
-
-  /**
-   * FrameTimeBaseline: Collects frame time and tick time samples for p95/p99 analysis.
-   * Used to establish performance baselines before/after refactoring phases.
-   * Access via: TU.FrameTimeBaseline.getReport()
-   */
-  TU.FrameTimeBaseline = {
-    _frameTimes: new Float64Array(600),  // ~10s at 60fps
-    _tickTimes: new Float64Array(600),
-    _idx: 0,
-    _count: 0,
-    _collecting: false,
-    _startedAt: 0,
-
-    start() {
-      this._idx = 0;
-      this._count = 0;
-      this._collecting = true;
-      this._startedAt = performance.now();
-      console.log('[FrameTimeBaseline] Collection started');
-    },
-
-    stop() {
-      this._collecting = false;
-      console.log('[FrameTimeBaseline] Collection stopped after', this._count, 'samples');
-    },
-
-    recordFrame(frameMs) {
-      if (!this._collecting) return;
-      const i = this._idx % 600;
-      this._frameTimes[i] = frameMs;
-      this._idx++;
-      this._count = Math.min(this._count + 1, 600);
-    },
-
-    recordTick(tickMs) {
-      if (!this._collecting) return;
-      const i = (this._idx - 1) % 600;
-      this._tickTimes[i] = tickMs;
-    },
-
-    _percentile(arr, count, p) {
-      if (count === 0) return 0;
-      const sorted = Array.from(arr.subarray(0, count)).sort((a, b) => a - b);
-      const idx = Math.min(Math.ceil(p / 100 * count) - 1, count - 1);
-      return sorted[idx];
-    },
-
-    getReport() {
-      const n = this._count;
-      return {
-        samples: n,
-        collectionMs: this._collecting ? performance.now() - this._startedAt : 0,
-        frame: {
-          p50: this._percentile(this._frameTimes, n, 50),
-          p95: this._percentile(this._frameTimes, n, 95),
-          p99: this._percentile(this._frameTimes, n, 99),
-          max: n > 0 ? Math.max(...Array.from(this._frameTimes.subarray(0, n))) : 0
-        },
-        tick: {
-          p50: this._percentile(this._tickTimes, n, 50),
-          p95: this._percentile(this._tickTimes, n, 95),
-          p99: this._percentile(this._tickTimes, n, 99),
-          max: n > 0 ? Math.max(...Array.from(this._tickTimes.subarray(0, n))) : 0
-        }
-      };
-    }
-  };
-
-  // Auto-start baseline collection on game init
-  try {
-    window.GameEvents && window.GameEvents.on('game:init:post', () => {
-      TU.FrameTimeBaseline.start();
-      // Auto-stop after 10 seconds
-      setTimeout(() => {
-        TU.FrameTimeBaseline.stop();
-        const report = TU.FrameTimeBaseline.getReport();
-        console.log('[FrameTimeBaseline] Initial report:', JSON.stringify(report, null, 2));
-        window.__TU_PERF__ = window.__TU_PERF__ || {};
-        window.__TU_PERF__.baseline = report;
-      }, 10000);
-    });
-  } catch (_) {}
-
   // Lightweight Profiler (default OFF)
   // World buffers: tiles/light/walls -> flat TypedArray + subarray views
   function flatifyColumns(cols, w, h, ctor) {
@@ -37073,9 +36431,7 @@ window.addEventListener("load", () => {
   function buildFullPayload(ss) {
     const g = window.AppServices.get("game");
     const world = window.AppServices.get("world");
-    // [Phase 3] Include block palette mapping in save header for ID drift protection
-    const palette = TU.BlockRegistry ? TU.BlockRegistry.getPalette() : null;
-    const payload = {
+    return {
       v: 1,
       kind: "full",
       ts: now(),
@@ -37086,8 +36442,6 @@ window.addEventListener("load", () => {
       h: world.h,
       diffs: SaveSystem._encodeDiff ? SaveSystem._encodeDiff(ss.diff, world.w) : { fmt: "rle1", w: world.w, data: [] }
     };
-    if (palette && Object.keys(palette).length > 0) payload.blockPalette = palette;
-    return payload;
   }
 
   function buildLitePayload(ss) {
@@ -37405,126 +36759,6 @@ window.addEventListener("load", () => {
     return _origApplyToWorld ? _origApplyToWorld.call(this, world, s || saveObj) : void 0;
   };
 })();
-
-</script>
-  <script>
-// === [Phase 4] Architecture Validation & Diagnostics ===
-(function() {
-  'use strict';
-  const TU = window.TU || {};
-  
-  /**
-   * TU.Diagnostics: Validates the architecture refactoring results.
-   * Run TU.Diagnostics.validate() in console to check system health.
-   */
-  TU.Diagnostics = {
-    validate() {
-      const results = [];
-      const pass = (name) => results.push({ name, status: 'PASS' });
-      const fail = (name, reason) => results.push({ name, status: 'FAIL', reason });
-      const warn = (name, reason) => results.push({ name, status: 'WARN', reason });
-
-      // 1. TU.Safe enhanced
-      if (TU.Safe && TU.Safe.runAsync) pass('TU.Safe.runAsync exists');
-      else fail('TU.Safe.runAsync', 'Missing async error handler');
-      
-      if (TU.Safe && TU.Safe.GlobalErrorBoundary) pass('GlobalErrorBoundary exists');
-      else fail('GlobalErrorBoundary', 'Missing error boundary');
-
-      if (TU.Safe && TU.Safe.SEVERITY) pass('Error severity classification');
-      else fail('Error severity', 'Missing SEVERITY constants');
-
-      // 2. Canvas optimizer scoped
-      if (TU.CanvasOptimizer && typeof TU.CanvasOptimizer.optimize === 'function') pass('CanvasOptimizer scoped');
-      else fail('CanvasOptimizer', 'Global canvas hijack may still be active');
-
-      // 3. PostFX pipeline
-      const Renderer = TU.Renderer;
-      if (Renderer && Renderer.prototype && typeof Renderer.prototype.registerPostFxStage === 'function') pass('PostFX pipeline infrastructure');
-      else fail('PostFX pipeline', 'Missing registerPostFxStage');
-
-      // 4. BlockRegistry
-      if (TU.BlockRegistry && typeof TU.BlockRegistry.allocate === 'function') {
-        pass('BlockRegistry exists');
-        const palette = TU.BlockRegistry.getPalette();
-        const count = Object.keys(palette).length;
-        if (count > 0) pass('BlockRegistry has ' + count + ' entries');
-        else warn('BlockRegistry', 'No entries registered yet');
-      } else {
-        fail('BlockRegistry', 'Missing');
-      }
-
-      // 5. StorageAdapter
-      if (TU.StorageAdapter && typeof TU.StorageAdapter.write === 'function') {
-        pass('StorageAdapter exists');
-        pass('StorageAdapter mode: ' + TU.StorageAdapter.getMode());
-      } else {
-        fail('StorageAdapter', 'Missing');
-      }
-
-      // 6. FrameTimeBaseline
-      if (TU.FrameTimeBaseline && typeof TU.FrameTimeBaseline.getReport === 'function') pass('FrameTimeBaseline collector');
-      else warn('FrameTimeBaseline', 'Missing');
-
-      // 7. game:init:post double-fire check
-      if (window.Game && window.Game.prototype && window.Game.prototype.__tuGameReadyEvent) {
-        pass('game:init:post double-fire guard active');
-      } else if (TU.Game && TU.Game.prototype && TU.Game.prototype.__tuGameReadyEvent) {
-        pass('game:init:post double-fire guard active');
-      } else {
-        warn('game:init:post', 'Guard flag not found');
-      }
-
-      // 8. InputManager native safety
-      const IM = TU.InputManager;
-      if (IM && IM.prototype && IM.prototype.__tuInputSafety) pass('InputManager native safety');
-      else warn('InputManager', 'Safety not merged');
-
-      // 9. AudioManager native enabled
-      const AM = TU.AudioManager;
-      if (AM && AM.prototype && AM.prototype.__tuAudioVisPatch) pass('AudioManager native enabled fix');
-      else warn('AudioManager', 'Enabled fix not merged');
-
-      // 10. Error summary
-      if (TU.Safe && TU.Safe.GlobalErrorBoundary) {
-        const summary = TU.Safe.GlobalErrorBoundary.getSummary();
-        if (summary.bySeverity.fatal > 0) fail('Fatal errors: ' + summary.bySeverity.fatal, JSON.stringify(summary));
-        else pass('Zero fatal errors');
-      }
-
-      // Print results
-      console.group('[TU.Diagnostics] Architecture Validation');
-      let passes = 0, fails = 0, warns = 0;
-      for (const r of results) {
-        if (r.status === 'PASS') { console.log('%c PASS %c ' + r.name, 'background:#2ecc71;color:white;padding:1px 4px;border-radius:3px', ''); passes++; }
-        else if (r.status === 'FAIL') { console.error('%c FAIL %c ' + r.name + (r.reason ? ' - ' + r.reason : ''), 'background:#e74c3c;color:white;padding:1px 4px;border-radius:3px', ''); fails++; }
-        else { console.warn('%c WARN %c ' + r.name + (r.reason ? ' - ' + r.reason : ''), 'background:#f39c12;color:white;padding:1px 4px;border-radius:3px', ''); warns++; }
-      }
-      console.log('Summary: ' + passes + ' pass, ' + warns + ' warn, ' + fails + ' fail');
-      console.groupEnd();
-      return { passes, warns, fails, results };
-    }
-  };
-
-  // Auto-run validation 3s after game init
-  try {
-    window.GameEvents && window.GameEvents.on('game:init:post', () => {
-      setTimeout(() => {
-        try {
-          console.log('[TU] Architecture refactor validation running...');
-          TU.Diagnostics.validate();
-          // Freeze BlockRegistry after init
-          if (TU.BlockRegistry && typeof TU.BlockRegistry.freeze === 'function') {
-            TU.BlockRegistry.freeze();
-          }
-        } catch (e) {
-          console.error('[TU.Diagnostics] Validation failed:', e);
-        }
-      }, 3000);
-    });
-  } catch (_) {}
-})();
-// === End Phase 4 Diagnostics ===
 
 </script>
 </body>
