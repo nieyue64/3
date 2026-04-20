@@ -18925,6 +18925,13 @@ class Renderer {
         alpha: !1
       }));
       this.ctx.imageSmoothingEnabled = !1;
+      // [Phase 2 fix] Apply CanvasOptimizer immediately to game canvas context
+      // This ensures optimization is active from the very first frame (texture warmup etc.)
+      try {
+        if (window.TU && window.TU.CanvasOptimizer && typeof window.TU.CanvasOptimizer.optimize === 'function') {
+          window.TU.CanvasOptimizer.optimize(this.ctx);
+        }
+      } catch (_) {}
     }
     window.GameEvents.on('block:written', e => this.invalidateTile(e.x, e.y));
     if (!this.ctx) throw Error("Canvas 2D context initialization failed");
