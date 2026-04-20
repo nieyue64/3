@@ -4978,174 +4978,29 @@ window.TU = window.TU || {};
     return c(tag, err);
   }
 
-  /** Severity levels for error classification */
-  const SEVERITY = { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', FATAL: 'fatal' };
-
-  /**
-   * Classify error severity based on tag and error type.
-   * Fatal: IDB write, save corruption, worker hang
-   * High: render pipeline, game init
-   * Medium: audio, UI
-   * Low: cosmetic, optional features
-   */
-  function classifyError(tag, error) {
-    const t = (tag || '').toLowerCase();
-    if (t.includes('idb') || t.includes('save') || t.includes('storage') || t.includes('quota')) return SEVERITY.FATAL;
-    if (t.includes('worker') && (t.includes('hang') || t.includes('timeout'))) return SEVERITY.FATAL;
-    if (t.includes('render') || t.includes('init') || t.includes('postfx')) return SEVERITY.HIGH;
-    if (t.includes('audio') || t.includes('ui') || t.includes('input')) return SEVERITY.MEDIUM;
-    if (error && error.name === 'QuotaExceededError') return SEVERITY.FATAL;
-    return SEVERITY.LOW;
-  }
-
   function run(tag, fn, opts) {
     try {
       return fn();
     } catch (e) {
       const o = opts || {};
       const level = o.level || "error";
-      const severity = o.severity || classifyError(tag, e);
-      const entry = { tag: tag || "unknown", error: e, at: Date.now(), severity: severity };
+      const entry = { tag: tag || "unknown", error: e, at: Date.now() };
       errors.push(entry);
       errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
-      // Always log to console -- never swallow silently
       try {
-        log(level, '[TU.Safe] ' + tag, e);
-      } catch (logErr) {
-        console.error('[TU.Safe] logging failed for:', tag, e, logErr);
-      }
-      // Surface fatal/high errors to user via toast
-      if (severity === SEVERITY.FATAL || severity === SEVERITY.HIGH) {
-        toast(o.toastMessage || ('\u26a0\ufe0f Error in ' + (tag || 'unknown')), o.toastMs || 3000, o.toastKey || tag, o.cooldownMs || 5000);
-      } else if (o.toastMessage) {
-        toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
-      }
-      // Emit error event for monitoring
-      try {
-        if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-          window.GameEvents.emit('error:caught', { tag, error: e, severity, at: Date.now() });
-        }
-      } catch (_) { /* prevent infinite recursion */ }
+        log(level, tag, e);
+      } catch(e){console.warn('[Catch]',e);}
+      if (o.toastMessage) toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
       if (o.rethrow) throw e;
       return o.fallback;
     }
   }
-
-  /**
-   * Async-safe version of run() for Promise-based operations.
-   * Catches both sync throws and async rejections.
-   * @param {string} tag - Error context tag
-   * @param {Function} asyncFn - Async function to execute
-   * @param {Object} [opts] - Options (same as run, plus onError callback)
-   * @returns {Promise<*>} Result or fallback
-   */
-  async function runAsync(tag, asyncFn, opts) {
-    try {
-      return await asyncFn();
-    } catch (e) {
-      const o = opts || {};
-      const level = o.level || "error";
-      const severity = o.severity || classifyError(tag, e);
-      const entry = { tag: tag || "unknown", error: e, at: Date.now(), severity: severity, async: true };
-      errors.push(entry);
-      errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
-      try {
-        log(level, '[TU.Safe.async] ' + tag, e);
-      } catch (logErr) {
-        console.error('[TU.Safe.async] logging failed for:', tag, e, logErr);
-      }
-      if (severity === SEVERITY.FATAL || severity === SEVERITY.HIGH) {
-        toast(o.toastMessage || ('\u26a0\ufe0f Async error in ' + (tag || 'unknown')), o.toastMs || 3000, o.toastKey || tag, o.cooldownMs || 5000);
-      } else if (o.toastMessage) {
-        toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
-      }
-      try {
-        if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-          window.GameEvents.emit('error:caught', { tag, error: e, severity, at: Date.now(), async: true });
-        }
-      } catch (_) { /* prevent infinite recursion */ }
-      if (typeof o.onError === 'function') {
-        try { o.onError(e, tag, severity); } catch (_) {}
-      }
-      if (o.rethrow) throw e;
-      return o.fallback;
-    }
-  }
-
-  /**
-   * GlobalErrorBoundary: monitors critical subsystems for silent failures
-   * - Worker message timeout detection
-   * - IDB write failure tracking
-   * - Audio context state monitoring
-   */
-  const GlobalErrorBoundary = {
-    _workerTimeouts: new Map(),
-    _idbFailures: 0,
-    _maxIdbFailures: 5,
-
-    /** Track a pending worker message; fires callback if no response within timeoutMs */
-    trackWorkerMessage(id, timeoutMs, onTimeout) {
-      const timer = setTimeout(() => {
-        GlobalErrorBoundary._workerTimeouts.delete(id);
-        const msg = 'Worker message ' + id + ' timed out after ' + timeoutMs + 'ms';
-        console.error('[GlobalErrorBoundary]', msg);
-        errors.push({ tag: 'worker:timeout', error: new Error(msg), at: Date.now(), severity: SEVERITY.FATAL });
-        toast('\u26a0\ufe0f Worker hung: ' + id, 3000, 'worker-timeout-' + id, 10000);
-        if (typeof onTimeout === 'function') onTimeout(id);
-      }, timeoutMs || 30000);
-      GlobalErrorBoundary._workerTimeouts.set(id, timer);
-    },
-
-    /** Clear a tracked worker message (response received) */
-    clearWorkerMessage(id) {
-      const timer = GlobalErrorBoundary._workerTimeouts.get(id);
-      if (timer) { clearTimeout(timer); GlobalErrorBoundary._workerTimeouts.delete(id); }
-    },
-
-    /** Record an IDB write failure; triggers degraded mode after threshold */
-    recordIdbFailure(error) {
-      GlobalErrorBoundary._idbFailures++;
-      console.error('[GlobalErrorBoundary] IDB write failure #' + GlobalErrorBoundary._idbFailures, error);
-      if (GlobalErrorBoundary._idbFailures >= GlobalErrorBoundary._maxIdbFailures) {
-        toast('\u26a0\ufe0f IndexedDB repeatedly failing - saves may be lost!', 5000, 'idb-critical', 30000);
-        try {
-          if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-            window.GameEvents.emit('storage:critical', { failures: GlobalErrorBoundary._idbFailures });
-          }
-        } catch (_) {}
-      }
-    },
-
-    /** Check audio context health */
-    checkAudioHealth(audioCtx) {
-      if (!audioCtx) return;
-      if (audioCtx.state === 'closed') {
-        console.warn('[GlobalErrorBoundary] AudioContext is closed unexpectedly');
-        toast('\u26a0\ufe0f Audio context closed', 2000, 'audio-closed', 15000);
-      }
-    },
-
-    /** Get error summary for diagnostics */
-    getSummary() {
-      const byTag = {};
-      const bySeverity = { low: 0, medium: 0, high: 0, fatal: 0 };
-      for (const e of errors) {
-        byTag[e.tag] = (byTag[e.tag] || 0) + 1;
-        if (e.severity) bySeverity[e.severity] = (bySeverity[e.severity] || 0) + 1;
-      }
-      return { total: errors.length, byTag, bySeverity, idbFailures: GlobalErrorBoundary._idbFailures, pendingWorkers: GlobalErrorBoundary._workerTimeouts.size };
-    }
-  };
 
   TU.Safe = {
     run,
-    runAsync,
     toast,
     shouldFire,
-    errors,
-    SEVERITY,
-    classifyError,
-    GlobalErrorBoundary
+    errors
   };
 })();
 document.getElementById('error-toggle')?.addEventListener('click', function() {
@@ -5272,31 +5127,18 @@ window.AppServices = new class ServiceLocator {
         try {
           return localStorage.getItem(k);
         } catch (e) {
-          console.warn('[Storage.get] failed for key:', k, e);
           return null;
         }
       },
       set: (k, v) => {
         try {
           localStorage.setItem(k, v);
-        } catch (e) {
-          console.error('[Storage.set] failed for key:', k, e);
-          if (e && e.name === 'QuotaExceededError') {
-            try {
-              if (window.GameEvents && typeof window.GameEvents.emit === 'function') {
-                window.GameEvents.emit('storage:quotaExceeded', { key: k, error: e });
-                window.GameEvents.emit('ui:toast', '\u26a0\ufe0f Storage quota exceeded! Save data may be lost.', 4000);
-              }
-            } catch (_) {}
-          }
-        }
+        } catch(e){console.warn('[Catch]',e);}
       },
       remove: k => {
         try {
           window.localStorage.removeItem(k);
-        } catch (e) {
-          console.warn('[Storage.remove] failed for key:', k, e);
-        }
+        } catch(e){console.warn('[Catch]',e);}
       }
     });
     this.register("session", {
@@ -8897,12 +8739,7 @@ Object.assign(window.TU, {
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        console.error('[IndexedDBStorage] set failed:', key, e);
-        // Report to GlobalErrorBoundary for IDB failure tracking
-        try {
-          const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-          if (boundary) boundary.recordIdbFailure(e);
-        } catch (_) {}
+        console.warn('[IndexedDBStorage] set failed:', e);
         return false;
       }
     }
@@ -8919,11 +8756,7 @@ Object.assign(window.TU, {
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        console.error('[IndexedDBStorage] remove failed:', key, e);
-        try {
-          const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-          if (boundary) boundary.recordIdbFailure(e);
-        } catch (_) {}
+        console.warn('[IndexedDBStorage] remove failed:', e);
         return false;
       }
     }
@@ -8940,11 +8773,7 @@ Object.assign(window.TU, {
           request.onerror = () => reject(request.error);
         });
       } catch (e) {
-        console.error('[IndexedDBStorage] clear failed:', e);
-        try {
-          const boundary = window.TU && window.TU.Safe && window.TU.Safe.GlobalErrorBoundary;
-          if (boundary) boundary.recordIdbFailure(e);
-        } catch (_) {}
+        console.warn('[IndexedDBStorage] clear failed:', e);
         return false;
       }
     }
@@ -29222,22 +29051,36 @@ window.TU;
         function addBlock(id, def) {
           try {
             BD[id] = def;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             SOLID[id] = def.solid ? 1 : 0;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             TRANSP[id] = def.transparent ? 1 : 0;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             LIQ[id] = def.liquid ? 1 : 0;
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             BL && (BL[id] = def.light ? 0 | def.light : 0);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             BH && (BH[id] = def.hardness ? +def.hardness : 0);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             BC && (BC[id] = def.color);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             WALK && (WALK[id] = def.solid ? 0 : 1);
+          } catch(e){console.warn('[Catch]',e);}
+          try {
             if (SD) {
               const AIR = BLOCK && void 0 !== BLOCK.AIR ? BLOCK.AIR : 0;
               let v = 0;
               def.solid && !def.transparent ? v = 3 : def.transparent && id !== AIR && (v = 1);
               SD[id] = v;
             }
-          } catch (e) {
-            console.error('[addBlock] Failed to register block id=' + id + ' name=' + (def && def.name), e);
-          }
+          } catch(e){console.warn('[Catch]',e);}
         }
         IDS.PUMP_IN || (IDS.PUMP_IN = allocId(206));
         IDS.PUMP_OUT || (IDS.PUMP_OUT = allocId(1 + (0 | IDS.PUMP_IN)));
@@ -31571,90 +31414,6 @@ window.TU;
       P.enabled = "1" === window.AppServices.get("storage").get("tu_profiler_enabled");
       return P;
     }();
-
-  /**
-   * FrameTimeBaseline: Collects frame time and tick time samples for p95/p99 analysis.
-   * Used to establish performance baselines before/after refactoring phases.
-   * Access via: TU.FrameTimeBaseline.getReport()
-   */
-  TU.FrameTimeBaseline = {
-    _frameTimes: new Float64Array(600),  // ~10s at 60fps
-    _tickTimes: new Float64Array(600),
-    _idx: 0,
-    _count: 0,
-    _collecting: false,
-    _startedAt: 0,
-
-    start() {
-      this._idx = 0;
-      this._count = 0;
-      this._collecting = true;
-      this._startedAt = performance.now();
-      console.log('[FrameTimeBaseline] Collection started');
-    },
-
-    stop() {
-      this._collecting = false;
-      console.log('[FrameTimeBaseline] Collection stopped after', this._count, 'samples');
-    },
-
-    recordFrame(frameMs) {
-      if (!this._collecting) return;
-      const i = this._idx % 600;
-      this._frameTimes[i] = frameMs;
-      this._idx++;
-      this._count = Math.min(this._count + 1, 600);
-    },
-
-    recordTick(tickMs) {
-      if (!this._collecting) return;
-      const i = (this._idx - 1) % 600;
-      this._tickTimes[i] = tickMs;
-    },
-
-    _percentile(arr, count, p) {
-      if (count === 0) return 0;
-      const sorted = Array.from(arr.subarray(0, count)).sort((a, b) => a - b);
-      const idx = Math.min(Math.ceil(p / 100 * count) - 1, count - 1);
-      return sorted[idx];
-    },
-
-    getReport() {
-      const n = this._count;
-      return {
-        samples: n,
-        collectionMs: this._collecting ? performance.now() - this._startedAt : 0,
-        frame: {
-          p50: this._percentile(this._frameTimes, n, 50),
-          p95: this._percentile(this._frameTimes, n, 95),
-          p99: this._percentile(this._frameTimes, n, 99),
-          max: n > 0 ? Math.max(...Array.from(this._frameTimes.subarray(0, n))) : 0
-        },
-        tick: {
-          p50: this._percentile(this._tickTimes, n, 50),
-          p95: this._percentile(this._tickTimes, n, 95),
-          p99: this._percentile(this._tickTimes, n, 99),
-          max: n > 0 ? Math.max(...Array.from(this._tickTimes.subarray(0, n))) : 0
-        }
-      };
-    }
-  };
-
-  // Auto-start baseline collection on game init
-  try {
-    window.GameEvents && window.GameEvents.on('game:init:post', () => {
-      TU.FrameTimeBaseline.start();
-      // Auto-stop after 10 seconds
-      setTimeout(() => {
-        TU.FrameTimeBaseline.stop();
-        const report = TU.FrameTimeBaseline.getReport();
-        console.log('[FrameTimeBaseline] Initial report:', JSON.stringify(report, null, 2));
-        window.__TU_PERF__ = window.__TU_PERF__ || {};
-        window.__TU_PERF__.baseline = report;
-      }, 10000);
-    });
-  } catch (_) {}
-
   // Lightweight Profiler (default OFF)
   // World buffers: tiles/light/walls -> flat TypedArray + subarray views
   function flatifyColumns(cols, w, h, ctor) {
